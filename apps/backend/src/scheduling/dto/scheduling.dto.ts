@@ -1,0 +1,82 @@
+import { Type } from 'class-transformer';
+import {
+  IsArray,
+  IsBoolean,
+  IsDateString,
+  IsInt,
+  IsOptional,
+  IsString,
+  Min,
+} from 'class-validator';
+
+export class CreateVenueDto {
+  @IsString()
+  name: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  sortOrder?: number;
+}
+
+export class UpdateVenueDto {
+  @IsOptional()
+  @IsString()
+  name?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  sortOrder?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  isActive?: boolean;
+}
+
+export class AutoScheduleDto {
+  @IsString()
+  tournamentId: string;
+
+  @IsOptional()
+  @IsString()
+  eventId?: string;
+
+  @IsDateString()
+  startAt: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(5)
+  matchMinutes?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  breakMinutes?: number;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  venueIds?: string[];
+}
+
+export class UpdateMatchScheduleDto {
+  @IsOptional()
+  @IsString()
+  venueId?: string | null;
+
+  @IsOptional()
+  @IsDateString()
+  scheduledAt?: string | null;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(5)
+  durationMinutes?: number;
+}
