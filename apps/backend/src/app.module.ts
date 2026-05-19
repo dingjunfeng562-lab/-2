@@ -12,6 +12,8 @@ import { ScoringModule } from './scoring/scoring.module';
 import { SchedulingModule } from './scheduling/scheduling.module';
 import { ExportsModule } from './exports/exports.module';
 import { TeamCompetitionsModule } from './team-competitions/team-competitions.module';
+import { CompetitionsModule } from './competitions/competitions.module';
+import { AnnouncementsModule } from './announcements/announcements.module';
 
 @Module({
   imports: [
@@ -28,6 +30,8 @@ import { TeamCompetitionsModule } from './team-competitions/team-competitions.mo
     SchedulingModule,
     ExportsModule,
     TeamCompetitionsModule,
+    CompetitionsModule,
+    AnnouncementsModule,
   ],
 })
 export class AppModule {}

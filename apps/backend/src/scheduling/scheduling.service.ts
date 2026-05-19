@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -31,6 +30,8 @@ type ScheduleMatch = {
   round: string;
   roundNo: number;
   matchNo: number;
+  side1Id: string | null;
+  side2Id: string | null;
   side1: RegistrationView | null;
   side2: RegistrationView | null;
   status: MatchStatus;
@@ -38,12 +39,20 @@ type ScheduleMatch = {
   venueName: string | null;
   scheduledAt: Date | null;
   durationMinutes: number;
+  dependenciesReady: boolean;
+  dependencyMatchIds: string[];
+  scheduleStatus: 'WAITING_SCHEDULE' | 'PENDING' | 'LIVE' | 'COMPLETED' | 'CANCELLED';
 };
 
 type ConflictItem = {
-  type: 'VENUE' | 'PLAYER';
+  type: 'VENUE' | 'PLAYER' | 'DEPENDENCY' | 'UNSCHEDULED';
   matchIds: string[];
   message: string;
+};
+
+type BusyInterval = {
+  start: number;
+  end: number;
 };
 
 @Injectable()
@@ -119,8 +128,7 @@ export class SchedulingService {
     const startAt = new Date(dto.startAt);
     if (Number.isNaN(startAt.getTime())) throw new BadRequestException('开始时间无效');
     const matchMinutes = dto.matchMinutes ?? 45;
-    const breakMinutes = dto.breakMinutes ?? 5;
-    const slotMinutes = matchMinutes + breakMinutes;
+    const breakMinutes = dto.breakMinutes ?? 10;
 
     const venueWhere: Prisma.VenueWhereInput = {
       tournamentId: dto.tournamentId,
@@ -133,69 +141,131 @@ export class SchedulingService {
     });
     if (!venues.length) throw new BadRequestException('请先维护至少一个可用场地');
 
-    const matches = await this.prisma.match.findMany({
+    const scopeMatches = await this.prisma.match.findMany({
       where: {
         event: {
           tournamentId: dto.tournamentId,
           ...(dto.eventId ? { id: dto.eventId } : {}),
         },
-        side1Id: { not: null },
-        side2Id: { not: null },
-        status: { not: MatchStatus.COMPLETED },
       },
       include: { event: true },
       orderBy: [{ roundNo: 'asc' }, { matchNo: 'asc' }],
     });
-    if (!matches.length) throw new BadRequestException('暂无可排程场次，请先完成抽签编排');
+    if (!scopeMatches.length) throw new BadRequestException('暂无可排程场次，请先完成抽签编排');
 
+    const matchMap = new Map(
+      scopeMatches
+        .filter((match) => match.eventId)
+        .map((match) => [this.matchKey(match.eventId!, match.roundNo, match.matchNo), match]),
+    );
+    const invalidCompletedIds = scopeMatches
+      .filter(
+        (match) =>
+          match.status === MatchStatus.COMPLETED && !this.dependenciesReady(match, matchMap),
+      )
+      .map((match) => match.id);
     const allScheduled = await this.loadScheduleMatches(dto.tournamentId);
-    const selectedIds = new Set(matches.map((match) => match.id));
+    const adjustableIds = new Set(
+      [
+        ...scopeMatches
+          .filter((match) => match.status === MatchStatus.PENDING)
+          .map((match) => match.id),
+        ...invalidCompletedIds,
+      ],
+    );
     const anchors = allScheduled.filter(
-      (match) => !selectedIds.has(match.id) && Boolean(match.scheduledAt),
+      (match) => !adjustableIds.has(match.id) && Boolean(match.scheduledAt),
     );
 
-    const venueAvailableAt = new Map(venues.map((venue) => [venue.id, startAt.getTime()]));
-    const playerAvailableAt = new Map<string, number>();
+    const venueBusy = new Map<string, BusyInterval[]>(venues.map((venue) => [venue.id, []]));
+    const playerBusy = new Map<string, BusyInterval[]>();
     for (const anchor of anchors) {
-      const endAt = this.endTime(anchor).getTime();
-      if (anchor.venueId && venueAvailableAt.has(anchor.venueId)) {
-        venueAvailableAt.set(anchor.venueId, Math.max(venueAvailableAt.get(anchor.venueId)!, endAt));
+      const endAt = this.addMinutes(anchor.scheduledAt!, anchor.durationMinutes).getTime();
+      if (anchor.venueId && venueBusy.has(anchor.venueId)) {
+        this.addBusyInterval(venueBusy, anchor.venueId, {
+          start: anchor.scheduledAt!.getTime(),
+          end: this.addMinutes(anchor.scheduledAt!, anchor.durationMinutes + breakMinutes).getTime(),
+        });
       }
       for (const playerId of this.matchPlayerIds(anchor)) {
-        playerAvailableAt.set(playerId, Math.max(playerAvailableAt.get(playerId) ?? startAt.getTime(), endAt));
+        this.addBusyInterval(playerBusy, playerId, {
+          start: anchor.scheduledAt!.getTime(),
+          end: endAt,
+        });
       }
     }
 
     const registrationMap = await this.registrationMap(
-      matches.flatMap((match) => [match.side1Id, match.side2Id]),
+      scopeMatches.flatMap((match) => [match.side1Id, match.side2Id]),
     );
+    const eventTypeRank = new Map((dto.eventTypeOrder ?? []).map((type, index) => [type, index]));
+    const readyMatches = scopeMatches
+      .filter(
+        (match) =>
+          match.status === MatchStatus.PENDING &&
+          Boolean(match.side1Id) &&
+          Boolean(match.side2Id) &&
+          this.dependenciesReady(match, matchMap),
+      )
+      .sort((a, b) => {
+        const aRank = eventTypeRank.get(a.event?.type ?? '') ?? Number.MAX_SAFE_INTEGER;
+        const bRank = eventTypeRank.get(b.event?.type ?? '') ?? Number.MAX_SAFE_INTEGER;
+        return a.roundNo - b.roundNo || a.matchNo - b.matchNo || aRank - bRank;
+      });
 
     const updates: Array<{ matchId: string; venueId: string; scheduledAt: Date }> = [];
-    for (const match of matches) {
+    for (const match of readyMatches) {
       const playerIds = [
         ...this.playerIds(registrationMap.get(match.side1Id!)),
         ...this.playerIds(registrationMap.get(match.side2Id!)),
       ];
-      const playerReadyAt = Math.max(
-        startAt.getTime(),
-        ...playerIds.map((playerId) => playerAvailableAt.get(playerId) ?? startAt.getTime()),
-      );
       const candidates = venues.map((venue) => ({
         venue,
-        startTime: Math.max(venueAvailableAt.get(venue.id) ?? startAt.getTime(), playerReadyAt),
+        startTime: this.findEarliestStart(
+          venue.id,
+          startAt.getTime(),
+          matchMinutes,
+          breakMinutes,
+          playerIds,
+          venueBusy,
+          playerBusy,
+        ),
       }));
       candidates.sort((a, b) => a.startTime - b.startTime || a.venue.sortOrder - b.venue.sortOrder);
       const winner = candidates[0];
       const scheduledAt = new Date(winner.startTime);
-      const endAt = this.addMinutes(scheduledAt, slotMinutes).getTime();
+      const matchEndAt = this.addMinutes(scheduledAt, matchMinutes).getTime();
 
       updates.push({ matchId: match.id, venueId: winner.venue.id, scheduledAt });
-      venueAvailableAt.set(winner.venue.id, endAt);
-      for (const playerId of playerIds) playerAvailableAt.set(playerId, endAt);
+      this.addBusyInterval(venueBusy, winner.venue.id, {
+        start: scheduledAt.getTime(),
+        end: this.addMinutes(scheduledAt, matchMinutes + breakMinutes).getTime(),
+      });
+      for (const playerId of playerIds) {
+        this.addBusyInterval(playerBusy, playerId, {
+          start: scheduledAt.getTime(),
+          end: matchEndAt,
+        });
+      }
     }
 
-    await this.prisma.$transaction(
-      updates.map((update) =>
+    await this.prisma.$transaction([
+      this.prisma.match.updateMany({
+        where: { id: { in: [...adjustableIds] } },
+        data: {
+          venueId: null,
+          scheduledAt: null,
+          durationMinutes: matchMinutes,
+        },
+      }),
+      this.prisma.match.updateMany({
+        where: { id: { in: invalidCompletedIds } },
+        data: {
+          status: MatchStatus.PENDING,
+          winnerSide: null,
+        },
+      }),
+      ...updates.map((update) =>
         this.prisma.match.update({
           where: { id: update.matchId },
           data: {
@@ -205,7 +275,7 @@ export class SchedulingService {
           },
         }),
       ),
-    );
+    ]);
 
     return this.getSchedule(dto.tournamentId, dto.eventId);
   }
@@ -260,28 +330,80 @@ export class SchedulingService {
     const registrationMap = await this.registrationMap(
       matches.flatMap((match) => [match.side1Id, match.side2Id]),
     );
+    const matchMap = new Map(
+      matches
+        .filter((match) => match.eventId)
+        .map((match) => [this.matchKey(match.eventId!, match.roundNo, match.matchNo), match]),
+    );
 
-    return matches.map<ScheduleMatch>((match) => ({
-      id: match.id,
-      eventId: match.eventId,
-      eventType: match.event?.type ?? 'TEAM_COMPETITION',
-      eventTypeLabel: match.event ? (EVENT_TYPE_LABELS[match.event.type] ?? match.event.type) : '团体赛',
-      round: match.round,
-      roundNo: match.roundNo,
-      matchNo: match.matchNo,
-      side1: match.side1Id ? this.registrationView(registrationMap.get(match.side1Id) ?? null) : null,
-      side2: match.side2Id ? this.registrationView(registrationMap.get(match.side2Id) ?? null) : null,
-      status: match.status,
-      venueId: match.venueId,
-      venueName: match.venue?.name ?? null,
-      scheduledAt: match.scheduledAt,
-      durationMinutes: match.durationMinutes,
-    }));
+    return matches.map<ScheduleMatch>((match) => {
+      const dependencyMatchIds = this.dependencyMatches(match, matchMap).map((item) => item.id);
+      const dependenciesReady = this.dependenciesReady(match, matchMap);
+      const hasFullSchedule = Boolean(match.scheduledAt && match.venueId && match.side1Id && match.side2Id && dependenciesReady);
+      const scheduleStatus =
+        (match.status === MatchStatus.PENDING && !hasFullSchedule) ||
+        (match.status === MatchStatus.COMPLETED && !dependenciesReady)
+          ? 'WAITING_SCHEDULE'
+          : match.status;
+      return {
+        id: match.id,
+        eventId: match.eventId,
+        eventType: match.event?.type ?? 'TEAM_COMPETITION',
+        eventTypeLabel: match.event ? (EVENT_TYPE_LABELS[match.event.type] ?? match.event.type) : '团体赛',
+        round: match.round,
+        roundNo: match.roundNo,
+        matchNo: match.matchNo,
+        side1Id: match.side1Id,
+        side2Id: match.side2Id,
+        side1: match.side1Id ? this.registrationView(registrationMap.get(match.side1Id) ?? null) : null,
+        side2: match.side2Id ? this.registrationView(registrationMap.get(match.side2Id) ?? null) : null,
+        status: match.status,
+        venueId: match.venueId,
+        venueName: match.venue?.name ?? null,
+        scheduledAt: match.scheduledAt,
+        durationMinutes: match.durationMinutes,
+        dependenciesReady,
+        dependencyMatchIds,
+        scheduleStatus,
+      };
+    });
   }
 
   private detectConflicts(matches: ScheduleMatch[]) {
     const conflicts: ConflictItem[] = [];
-    const scheduled = matches.filter((match) => match.scheduledAt);
+
+    for (const match of matches) {
+      if (match.status === MatchStatus.COMPLETED && !match.dependenciesReady) {
+        conflicts.push({
+          type: 'DEPENDENCY',
+          matchIds: [match.id],
+          message: `${match.eventTypeLabel} ${match.round} 第${match.matchNo}场被标记为已结束，但前置比赛尚未完成`,
+        });
+        continue;
+      }
+
+      if (match.status !== MatchStatus.PENDING) continue;
+
+      const lacksSides = !match.side1Id || !match.side2Id;
+      const lacksSchedule = !match.scheduledAt || !match.venueId;
+      if (!match.dependenciesReady || lacksSides) {
+        conflicts.push({
+          type: match.scheduledAt || match.venueId ? 'DEPENDENCY' : 'UNSCHEDULED',
+          matchIds: [match.id],
+          message: `${match.eventTypeLabel} ${match.round} 第${match.matchNo}场前置未完成或选手未确定`,
+        });
+        continue;
+      }
+      if (lacksSchedule) {
+        conflicts.push({
+          type: 'UNSCHEDULED',
+          matchIds: [match.id],
+          message: `${match.eventTypeLabel} ${match.round} 第${match.matchNo}场尚未分配时间和场地`,
+        });
+      }
+    }
+
+    const scheduled = matches.filter((match) => match.scheduledAt && match.venueId);
 
     for (let i = 0; i < scheduled.length; i += 1) {
       for (let j = i + 1; j < scheduled.length; j += 1) {
@@ -313,6 +435,97 @@ export class SchedulingService {
     return conflicts;
   }
 
+  private findEarliestStart(
+    venueId: string,
+    earliest: number,
+    matchMinutes: number,
+    breakMinutes: number,
+    playerIds: string[],
+    venueBusy: Map<string, BusyInterval[]>,
+    playerBusy: Map<string, BusyInterval[]>,
+  ) {
+    let start = earliest;
+    while (true) {
+      const venueConflict = this.findOverlap(venueBusy.get(venueId) ?? [], {
+        start,
+        end: start + (matchMinutes + breakMinutes) * 60 * 1000,
+      });
+      if (venueConflict) {
+        start = venueConflict.end;
+        continue;
+      }
+
+      const playerConflict = playerIds
+        .flatMap((playerId) => playerBusy.get(playerId) ?? [])
+        .sort((a, b) => a.start - b.start)
+        .find((interval) =>
+          this.intervalsOverlap(interval, {
+            start,
+            end: start + matchMinutes * 60 * 1000,
+          }),
+        );
+      if (playerConflict) {
+        start = playerConflict.end;
+        continue;
+      }
+
+      return start;
+    }
+  }
+
+  private findOverlap(intervals: BusyInterval[], target: BusyInterval) {
+    return intervals
+      .sort((a, b) => a.start - b.start)
+      .find((interval) => this.intervalsOverlap(interval, target));
+  }
+
+  private intervalsOverlap(a: BusyInterval, b: BusyInterval) {
+    return a.start < b.end && b.start < a.end;
+  }
+
+  private addBusyInterval(map: Map<string, BusyInterval[]>, key: string, interval: BusyInterval) {
+    const intervals = map.get(key) ?? [];
+    intervals.push(interval);
+    intervals.sort((a, b) => a.start - b.start);
+    map.set(key, intervals);
+  }
+
+  private dependenciesReady<T extends {
+    eventId: string | null;
+    roundNo: number;
+    matchNo: number;
+    status: MatchStatus;
+    winnerSide: number | null;
+  }>(
+    match: { eventId: string | null; roundNo: number; matchNo: number },
+    matchMap: Map<string, T>,
+  ) {
+    if (!match.eventId || match.roundNo <= 1) return true;
+    const dependencies = [
+      matchMap.get(this.matchKey(match.eventId, match.roundNo - 1, match.matchNo * 2 - 1)),
+      matchMap.get(this.matchKey(match.eventId, match.roundNo - 1, match.matchNo * 2)),
+    ];
+    return dependencies.every(
+      (dependency) =>
+        dependency?.status === MatchStatus.COMPLETED && Boolean(dependency.winnerSide),
+    );
+  }
+
+  private dependencyMatches<T extends { eventId: string | null; roundNo: number; matchNo: number }>(
+    match: T,
+    matchMap: Map<string, T>,
+  ) {
+    if (!match.eventId || match.roundNo <= 1) return [];
+    return [
+      matchMap.get(this.matchKey(match.eventId, match.roundNo - 1, match.matchNo * 2 - 1)),
+      matchMap.get(this.matchKey(match.eventId, match.roundNo - 1, match.matchNo * 2)),
+    ].filter((item): item is T => Boolean(item));
+  }
+
+  private matchKey(eventId: string, roundNo: number, matchNo: number) {
+    return `${eventId}:${roundNo}:${matchNo}`;
+  }
+
   private overlaps(a: ScheduleMatch, b: ScheduleMatch) {
     if (!a.scheduledAt || !b.scheduledAt) return false;
     return a.scheduledAt < this.endTime(b) && b.scheduledAt < this.endTime(a);
@@ -336,7 +549,7 @@ export class SchedulingService {
   }
 
   private async registrationMap(ids: Array<string | null>) {
-    const compactIds = ids.filter(Boolean) as string[];
+    const compactIds = [...new Set(ids.filter(Boolean) as string[])];
     if (!compactIds.length) return new Map<string, any>();
     const registrations = await this.prisma.registration.findMany({
       where: { id: { in: compactIds } },

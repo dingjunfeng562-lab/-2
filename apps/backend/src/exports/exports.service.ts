@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { MatchStatus } from '@prisma/client';
+import { MatchStatus, RegistrationStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 type ExportKind = 'schedule' | 'results' | 'registrations';
@@ -52,6 +52,7 @@ export class ExportsService {
         events: {
           include: {
             registrations: {
+              where: { status: RegistrationStatus.APPROVED },
               include: { player1: true, player2: true },
               orderBy: [{ groupName: 'asc' }, { isSeed: 'desc' }, { seedRank: 'asc' }, { createdAt: 'asc' }],
             },

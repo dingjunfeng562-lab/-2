@@ -25,6 +25,16 @@ export class PublicController {
     return this.publicService.getTeamCompetitions();
   }
 
+  @Get('announcements')
+  getAnnouncements() {
+    return this.publicService.getAnnouncements();
+  }
+
+  @Get('brackets')
+  getBrackets() {
+    return this.publicService.getBrackets();
+  }
+
   @Get('history')
   getHistory() {
     return this.publicService.getHistory();

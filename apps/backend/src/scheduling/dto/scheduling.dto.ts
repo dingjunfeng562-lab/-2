@@ -63,6 +63,11 @@ export class AutoScheduleDto {
   @IsArray()
   @IsString({ each: true })
   venueIds?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  eventTypeOrder?: string[];
 }
 
 export class UpdateMatchScheduleDto {

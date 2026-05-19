@@ -1,7 +1,8 @@
 import { Injectable } from '@nestjs/common';
-import { MatchStatus, TournamentStatus } from '@prisma/client';
+import { MatchStatus, RegistrationStatus, TournamentStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { TeamCompetitionsService } from '../team-competitions/team-competitions.service';
+import { AnnouncementsService } from '../announcements/announcements.service';
 
 const EVENT_TYPE_LABELS: Record<string, string> = {
   MENS_SINGLES: '男子单打',
@@ -26,6 +27,11 @@ const TOURNAMENT_STATUS_LABELS: Record<TournamentStatus, '报名中' | '即将�
   FINISHED: '已结束',
 };
 
+const FORMAT_LABELS: Record<string, string> = {
+  SINGLE_ELIMINATION: '单淘汰制',
+  GROUP_PLUS_KNOCKOUT: '小组赛+淘汰',
+};
+
 type StandingRow = {
   id: string;
   name: string;
@@ -42,15 +48,19 @@ export class PublicService {
   constructor(
     private prisma: PrismaService,
     private teamCompetitionsService: TeamCompetitionsService,
+    private announcementsService: AnnouncementsService,
   ) {}
 
   async getLobby() {
     const tournaments = await this.prisma.tournament.findMany({
-      where: { isArchived: false },
+      where: { isArchived: false, isPublished: true },
       include: {
         events: {
           include: {
-            _count: { select: { registrations: true } },
+            registrations: {
+              where: { status: RegistrationStatus.APPROVED },
+              select: { id: true },
+            },
           },
         },
         teamCompetitions: {
@@ -65,7 +75,7 @@ export class PublicService {
 
     const competitions = tournaments.map((tournament) => {
       const registeredCount = tournament.events.reduce(
-        (sum, event) => sum + event._count.registrations,
+        (sum, event) => sum + event.registrations.length,
         0,
       );
       const teamCompetitionCount = tournament.teamCompetitions.length;
@@ -86,6 +96,7 @@ export class PublicService {
         cover: tournament.coverImageUrl,
       };
     });
+    const publicAnnouncements = await this.announcementsService.findPublished(4);
 
     return {
       competitions,
@@ -96,19 +107,22 @@ export class PublicService {
         ongoing: competitions.filter((item) => item.status === '进行中').length,
         finished: competitions.filter((item) => item.status === '已结束').length,
       },
-      announcements: this.buildLobbyAnnouncements(competitions),
+      announcements: publicAnnouncements.length
+        ? publicAnnouncements
+        : this.buildLobbyAnnouncements(competitions),
     };
   }
 
   async getHome() {
+    const publicAnnouncements = await this.announcementsService.findPublished(4);
     const competition =
       (await this.prisma.tournament.findFirst({
-        where: { showOnHome: true, isArchived: false },
+        where: { showOnHome: true, isArchived: false, isPublished: true },
         include: { events: true },
         orderBy: [{ updatedAt: 'desc' }],
       })) ??
       (await this.prisma.tournament.findFirst({
-        where: { isArchived: false },
+        where: { isArchived: false, isPublished: true },
         include: { events: true },
         orderBy: [{ edition: 'desc' }],
       }));
@@ -119,7 +133,7 @@ export class PublicService {
         stats: { registrations: 0, events: 0, liveMatches: 0, promotedPlayers: 0 },
         schedules: [],
         bracketPreviews: [],
-        announcements: [],
+        announcements: publicAnnouncements,
       };
     }
 
@@ -127,7 +141,9 @@ export class PublicService {
     const teamCompetitions = await this.teamCompetitionsService.getPublicCompetitions(competition.id);
     const [registrationCount, liveMatches, promotedMatches, scheduleMatches, bracketEvents] =
       await Promise.all([
-        this.prisma.registration.count({ where: { eventId: { in: eventIds } } }),
+        this.prisma.registration.count({
+          where: { eventId: { in: eventIds }, status: RegistrationStatus.APPROVED },
+        }),
         this.prisma.match.count({
           where: { eventId: { in: eventIds }, status: MatchStatus.LIVE },
         }),
@@ -156,6 +172,7 @@ export class PublicService {
               take: 4,
             },
             registrations: {
+              where: { status: RegistrationStatus.APPROVED },
               include: { player1: true, player2: true },
               orderBy: [{ isSeed: 'desc' }, { seedRank: 'asc' }, { createdAt: 'asc' }],
               take: 4,
@@ -199,19 +216,21 @@ export class PublicService {
         title: `${EVENT_TYPE_LABELS[event.type] ?? event.type}对阵表`,
         players: event.registrations.map((registration) => this.registrationName(registration)),
       })),
-      announcements: this.buildAnnouncements(competition),
+      announcements: publicAnnouncements.length
+        ? publicAnnouncements
+        : this.buildAnnouncements(competition),
     };
   }
 
   async getScreen() {
     const competition =
       (await this.prisma.tournament.findFirst({
-        where: { showOnHome: true, isArchived: false },
+        where: { showOnHome: true, isArchived: false, isPublished: true },
         include: { events: true, venues: true },
         orderBy: [{ updatedAt: 'desc' }],
       })) ??
       (await this.prisma.tournament.findFirst({
-        where: { isArchived: false },
+        where: { isArchived: false, isPublished: true },
         include: { events: true, venues: true },
         orderBy: [{ edition: 'desc' }],
       }));
@@ -246,7 +265,9 @@ export class PublicService {
       recentResults,
       eventReports,
     ] = await Promise.all([
-      this.prisma.registration.count({ where: { eventId: { in: eventIds } } }),
+      this.prisma.registration.count({
+        where: { eventId: { in: eventIds }, status: RegistrationStatus.APPROVED },
+      }),
       this.prisma.match.count({
         where: { eventId: { in: eventIds }, status: MatchStatus.LIVE },
       }),
@@ -295,7 +316,7 @@ export class PublicService {
         include: {
           _count: {
             select: {
-              registrations: true,
+              registrations: { where: { status: RegistrationStatus.APPROVED } },
               matches: true,
             },
           },
@@ -374,6 +395,46 @@ export class PublicService {
     };
   }
 
+  async getAnnouncements() {
+    return {
+      announcements: await this.announcementsService.findPublished(50),
+    };
+  }
+
+  async getBrackets() {
+    const events = await this.prisma.event.findMany({
+      where: {
+        tournament: {
+          isPublished: true,
+          isArchived: false,
+        },
+        matches: { some: { roundNo: { gt: 0 } } },
+      },
+      include: {
+        tournament: true,
+        registrations: {
+          where: { status: RegistrationStatus.APPROVED },
+          include: { player1: true, player2: true },
+          orderBy: [{ isSeed: 'desc' }, { seedRank: 'asc' }, { createdAt: 'asc' }],
+        },
+        matches: {
+          where: { roundNo: { gt: 0 } },
+          include: {
+            venue: true,
+            referee: { select: { username: true } },
+            games: { orderBy: { gameNo: 'asc' } },
+          },
+          orderBy: [{ roundNo: 'asc' }, { matchNo: 'asc' }],
+        },
+      },
+      orderBy: [{ tournament: { startDate: 'desc' } }, { type: 'asc' }],
+    });
+
+    return {
+      brackets: events.map((event) => this.publicBracketView(event)),
+    };
+  }
+
   async getHistory() {
     const tournaments = await this.prisma.tournament.findMany({
       where: {
@@ -383,6 +444,7 @@ export class PublicService {
         events: {
           include: {
             registrations: {
+              where: { status: RegistrationStatus.APPROVED },
               include: { player1: true, player2: true },
               orderBy: [{ groupName: 'asc' }, { isSeed: 'desc' }, { seedRank: 'asc' }],
             },
@@ -474,6 +536,78 @@ export class PublicService {
     return registration.player2
       ? `${registration.player1.name} / ${registration.player2.name}`
       : registration.player1.name;
+  }
+
+  private publicBracketView(event: any) {
+    const registrationMap = new Map<string, any>(
+      event.registrations.map((item: any) => [item.id, item]),
+    );
+    const firstRound = event.matches
+      .filter((match: any) => match.roundNo === 1)
+      .sort((a: any, b: any) => a.matchNo - b.matchNo);
+    const participants = firstRound.length
+      ? firstRound.flatMap((match: any, index: number) => [
+          this.bracketParticipant(match.side1Id, index * 2 + 1, registrationMap),
+          this.bracketParticipant(match.side2Id, index * 2 + 2, registrationMap),
+        ])
+      : event.registrations.map((registration: any, index: number) => ({
+          id: registration.id,
+          position: index + 1,
+          name: this.registrationName(registration),
+          seed: registration.seedRank,
+          isBye: false,
+        }));
+
+    return {
+      id: event.id,
+      title: `${event.tournament.name} · ${EVENT_TYPE_LABELS[event.type] ?? event.type}`,
+      subtitle: `第 ${event.tournament.edition} 届 · ${FORMAT_LABELS[event.format] ?? event.format} · ${participants.filter((item: any) => !item.isBye).length} 个签位`,
+      generatedAt: event.drawGeneratedAt?.toISOString?.() ?? null,
+      participants,
+      matches: event.matches.map((match: any) => ({
+        id: match.id,
+        roundNo: match.roundNo,
+        roundLabel: match.round,
+        matchNo: match.matchNo,
+        status: match.status,
+        side1Id: match.side1Id,
+        side2Id: match.side2Id,
+        winnerSide: match.winnerSide,
+        winnerId: match.winnerSide === 1 ? match.side1Id : match.winnerSide === 2 ? match.side2Id : null,
+        venueName: match.venue?.name ?? '待排场地',
+        refereeName: match.referee?.username ?? null,
+        scheduledAt: match.scheduledAt?.toISOString?.() ?? null,
+        score: match.games.length
+          ? `${match.games.at(-1)?.side1Score ?? 0}:${match.games.at(-1)?.side2Score ?? 0}`
+          : '0:0',
+        gamesText: match.games.length
+          ? match.games.map((game: any) => `${game.side1Score}:${game.side2Score}`).join(' / ')
+          : '-',
+      })),
+    };
+  }
+
+  private bracketParticipant(
+    registrationId: string | null,
+    position: number,
+    registrationMap: Map<string, any>,
+  ) {
+    if (!registrationId) {
+      return {
+        id: `bye-position-${position}`,
+        position,
+        name: '— 轮空 —',
+        isBye: true,
+      };
+    }
+    const registration = registrationMap.get(registrationId);
+    return {
+      id: registrationId,
+      position,
+      name: registration ? this.registrationName(registration) : '待定',
+      seed: registration?.seedRank ?? null,
+      isBye: false,
+    };
   }
 
   private async registrationMap(ids: Array<string | null>) {

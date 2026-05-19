@@ -195,6 +195,7 @@ export class ScoringService {
           where: { id: matchId },
           data: { status: MatchStatus.COMPLETED, winnerSide: matchWinner },
         });
+        await this.advanceSingleEliminationWinner(tx, match, matchWinner);
         await this.teamCompetitionsService.updateTeamMatchAggregate(tx, matchId);
         return;
       }
@@ -374,6 +375,46 @@ export class ScoringService {
     if (side1Wins >= gamesToWin) return 1;
     if (side2Wins >= gamesToWin) return 2;
     return null;
+  }
+
+  private async advanceSingleEliminationWinner(
+    tx: Prisma.TransactionClient,
+    match: {
+      eventId: string | null;
+      roundNo: number;
+      matchNo: number;
+      side1Id: string | null;
+      side2Id: string | null;
+    },
+    winnerSide: 1 | 2,
+  ) {
+    if (!match.eventId || match.roundNo < 1) return;
+
+    const winnerId = winnerSide === 1 ? match.side1Id : match.side2Id;
+    if (!winnerId) return;
+
+    const nextMatch = await tx.match.findFirst({
+      where: {
+        eventId: match.eventId,
+        roundNo: match.roundNo + 1,
+        matchNo: Math.ceil(match.matchNo / 2),
+      },
+    });
+    if (!nextMatch) return;
+
+    const targetSide = match.matchNo % 2 === 1 ? 'side1Id' : 'side2Id';
+    const data: Prisma.MatchUncheckedUpdateInput = {
+      [targetSide]: winnerId,
+    };
+    if (nextMatch.status === MatchStatus.PENDING) {
+      data.venueId = null;
+      data.scheduledAt = null;
+    }
+
+    await tx.match.update({
+      where: { id: nextMatch.id },
+      data,
+    });
   }
 
   private ruleConfig(rule: ScoringRule) {

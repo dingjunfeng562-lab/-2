@@ -4,11 +4,25 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { EventType, Format, MatchStatus, Prisma, Registration } from '@prisma/client';
+import {
+  DrawFormat,
+  DrawOperationType,
+  DrawStatus,
+  Format,
+  MatchStatus,
+  Prisma,
+  Registration,
+  RegistrationStatus,
+  EventType,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { DrawAlgorithmService } from './draw-algorithm.service';
+import { DrawLogService } from './draw-log.service';
 import {
   CreateRegistrationDto,
   GenerateDrawDto,
+  GetDrawLogsQueryDto,
+  SeedItemDto,
   UpdateRegistrationDto,
 } from './dto/draw.dto';
 
@@ -29,12 +43,16 @@ type MatchDraft = {
 
 @Injectable()
 export class DrawsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly drawAlgorithmService: DrawAlgorithmService,
+    private readonly drawLogService: DrawLogService,
+  ) {}
 
   async listRegistrations(eventId: string) {
     await this.ensureEvent(eventId);
     return this.prisma.registration.findMany({
-      where: { eventId },
+      where: { eventId, status: RegistrationStatus.APPROVED },
       include: { player1: true, player2: true },
       orderBy: [{ isSeed: 'desc' }, { seedRank: 'asc' }, { createdAt: 'asc' }],
     });
@@ -63,6 +81,7 @@ export class DrawsService {
         eventId,
         player1Id: dto.player1Id,
         player2Id: dto.player2Id,
+        status: RegistrationStatus.APPROVED,
         isSeed: dto.isSeed ?? false,
         seedRank: dto.isSeed ? dto.seedRank : null,
       },
@@ -108,26 +127,540 @@ export class DrawsService {
     return this.prisma.registration.delete({ where: { id } });
   }
 
+  async getDrawDetail(eventId: string) {
+    await this.ensureEvent(eventId);
+
+    const [currentDraw, seedSettings, entrantCount] = await Promise.all([
+      this.prisma.drawBracket.findFirst({
+        where: { eventItemId: eventId, isCurrent: true },
+        include: {
+          slots: { orderBy: { position: 'asc' } },
+          groups: { include: { members: true }, orderBy: { sortOrder: 'asc' } },
+        },
+      }),
+      this.prisma.drawSeedSetting.findMany({
+        where: { eventItemId: eventId },
+        orderBy: { seedNo: 'asc' },
+      }),
+      this.prisma.registration.count({
+        where: { eventId, status: RegistrationStatus.APPROVED },
+      }),
+    ]);
+
+    return {
+      eventItemId: eventId,
+      hasDraw: Boolean(currentDraw),
+      currentDraw,
+      seedSettings,
+      entrantCount,
+      seedLimit: this.drawAlgorithmService.getSeedLimit(entrantCount),
+    };
+  }
+
+  async updateSeeds(
+    eventId: string,
+    seeds: SeedItemDto[],
+    operatorId: string,
+    operatorName: string | null,
+  ) {
+    if (!operatorId) throw new BadRequestException('缺少操作人信息');
+    await this.ensureEvent(eventId);
+
+    const registrations = await this.prisma.registration.findMany({
+      where: { eventId, status: RegistrationStatus.APPROVED },
+      select: { id: true },
+    });
+    const seedLimit = this.drawAlgorithmService.getSeedLimit(registrations.length);
+    this.validateSeedSettings(seeds, seedLimit);
+
+    const registrationIds = new Set(registrations.map((item) => item.id));
+    for (const seed of seeds) {
+      if (!registrationIds.has(seed.entrantId)) {
+        throw new BadRequestException('种子必须来自当前单项已通过报名');
+      }
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const before = await tx.drawSeedSetting.findMany({
+        where: { eventItemId: eventId },
+        orderBy: { seedNo: 'asc' },
+      });
+
+      await tx.drawSeedSetting.deleteMany({ where: { eventItemId: eventId } });
+      await tx.registration.updateMany({
+        where: { eventId },
+        data: { isSeed: false, seedRank: null },
+      });
+
+      if (seeds.length) {
+        await tx.drawSeedSetting.createMany({
+          data: seeds.map((seed) => ({
+            eventItemId: eventId,
+            entrantId: seed.entrantId,
+            seedNo: seed.seedNo,
+            createdBy: operatorId,
+          })),
+        });
+
+        for (const seed of seeds) {
+          await tx.registration.update({
+            where: { id: seed.entrantId },
+            data: {
+              isSeed: true,
+              seedRank: seed.seedNo,
+            },
+          });
+        }
+      }
+
+      const currentDraw = await tx.drawBracket.findFirst({
+        where: { eventItemId: eventId, isCurrent: true },
+      });
+      if (currentDraw) {
+        await this.drawLogService.create(tx, {
+          eventItemId: eventId,
+          drawBracketId: currentDraw.id,
+          operationType: DrawOperationType.SEED_UPDATE,
+          operatorId,
+          operatorNameSnapshot: operatorName,
+          beforeData: before as unknown as Prisma.InputJsonValue,
+          afterData: seeds as unknown as Prisma.InputJsonValue,
+        });
+      }
+
+      return {
+        eventItemId: eventId,
+        seedLimit,
+        seedCount: seeds.length,
+        seedSettings: seeds,
+      };
+    });
+  }
+
   async generateDraw(eventId: string, dto: GenerateDrawDto) {
     const event = await this.ensureEvent(eventId);
     if (event.drawLocked && !dto.force) {
       throw new ConflictException('抽签结果已冻结，如需覆盖请使用重新抽签');
     }
 
+    const operatorId = 'system';
+    const operatorName = 'system';
+    return this.executeDraw(eventId, operatorId, operatorName, dto.force ?? false);
+  }
+
+  async executeDraw(
+    eventId: string,
+    operatorId: string,
+    operatorName: string | null,
+    force = false,
+  ) {
+    if (!operatorId) throw new BadRequestException('缺少操作人信息');
+    const event = await this.ensureEvent(eventId);
+
+    const existingCurrent = await this.prisma.drawBracket.findFirst({
+      where: { eventItemId: eventId, isCurrent: true },
+    });
+    if (existingCurrent && existingCurrent.status === DrawStatus.FROZEN && !force) {
+      throw new ConflictException('当前签表已冻结，请使用重新抽签');
+    }
+
     const registrations = await this.prisma.registration.findMany({
-      where: { eventId },
+      where: { eventId, status: RegistrationStatus.APPROVED },
       include: { player1: true, player2: true },
       orderBy: [{ isSeed: 'desc' }, { seedRank: 'asc' }, { createdAt: 'asc' }],
     });
-    if (registrations.length < 2) throw new BadRequestException('至少需要 2 个报名才能抽签');
-
-    if (event.format === Format.GROUP_PLUS_KNOCKOUT) {
-      await this.generateGroupDraw(eventId, registrations, event.groupSize ?? 4);
-    } else {
-      await this.generateSingleEliminationDraw(eventId, registrations);
+    if (registrations.length < 2) {
+      throw new BadRequestException('至少需要 2 个报名才能抽签');
     }
 
-    return this.getBracket(eventId);
+    const seedSettings = await this.prisma.drawSeedSetting.findMany({
+      where: { eventItemId: eventId },
+      orderBy: { seedNo: 'asc' },
+    });
+    const seedLimit = this.drawAlgorithmService.getSeedLimit(registrations.length);
+    this.validateSeedSettings(seedSettings, seedLimit);
+
+    const latest = await this.prisma.drawBracket.findFirst({
+      where: { eventItemId: eventId },
+      orderBy: { version: 'desc' },
+    });
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.drawBracket.updateMany({
+        where: { eventItemId: eventId, isCurrent: true },
+        data: { isCurrent: false, updatedBy: operatorId },
+      });
+
+      const format =
+        event.format === Format.GROUP_PLUS_KNOCKOUT
+          ? DrawFormat.group_then_elim
+          : DrawFormat.single_elim;
+
+      let bracketSize = registrations.length;
+      let byeCount = 0;
+      let seedCount = seedSettings.length;
+
+      const draw = await tx.drawBracket.create({
+        data: {
+          eventItemId: eventId,
+          version: (latest?.version ?? 0) + 1,
+          isCurrent: true,
+          format,
+          status: DrawStatus.FROZEN,
+          bracketSize,
+          entrantCount: registrations.length,
+          seedLimit,
+          seedCount,
+          byeCount,
+          groupCount: event.groupSize ?? null,
+          qualifyPerGroup: event.qualifiersPerGroup ?? null,
+          executedAt: new Date(),
+          frozenAt: new Date(),
+          createdBy: operatorId,
+          updatedBy: operatorId,
+        },
+      });
+
+      if (format === DrawFormat.single_elim) {
+        const built = this.drawAlgorithmService.buildSingleEliminationSlots(
+          registrations.map((registration) => ({
+            id: registration.id,
+            name: this.registrationName(registration),
+          })),
+          seedSettings.map((seed) => ({ entrantId: seed.entrantId, seedNo: seed.seedNo })),
+        );
+
+        bracketSize = built.bracketSize;
+        byeCount = built.byeCount;
+        seedCount = seedSettings.length;
+
+        await tx.drawBracket.update({
+          where: { id: draw.id },
+          data: {
+            bracketSize,
+            byeCount,
+            seedCount,
+          },
+        });
+
+        await tx.drawSlot.createMany({
+          data: built.slots.map((slot) => ({
+            drawBracketId: draw.id,
+            position: slot.position,
+            entrantId: slot.entrantId,
+            entrantNameSnapshot: slot.entrantNameSnapshot,
+            seedNoSnapshot: slot.seedNoSnapshot,
+            isSeed: slot.isSeed,
+            isBye: slot.isBye,
+            sourceType: slot.sourceType,
+            groupRankCode: slot.groupRankCode,
+          })),
+        });
+
+        await this.materializeSingleElimination(tx, eventId, built.slots);
+      } else {
+        const groups = this.drawAlgorithmService.buildGroups(
+          registrations.map((registration) => ({
+            id: registration.id,
+            name: this.registrationName(registration),
+          })),
+          seedSettings.map((seed) => ({ entrantId: seed.entrantId, seedNo: seed.seedNo })),
+          event.groupSize ?? 4,
+        );
+
+        await tx.drawBracket.update({
+          where: { id: draw.id },
+          data: {
+            bracketSize: groups.length,
+            byeCount: 0,
+            seedCount,
+            groupCount: groups.length,
+          },
+        });
+
+        for (const group of groups) {
+          const createdGroup = await tx.drawGroup.create({
+            data: {
+              drawBracketId: draw.id,
+              groupCode: group.groupCode,
+              sortOrder: group.sortOrder,
+            },
+          });
+
+          await tx.drawGroupMember.createMany({
+            data: group.members.map((member) => ({
+              drawGroupId: createdGroup.id,
+              entrantId: member.entrantId,
+              entrantNameSnapshot: member.entrantNameSnapshot,
+              seedNoSnapshot: member.seedNoSnapshot,
+              groupRank: member.groupRank,
+              isQualified: member.isQualified,
+            })),
+          });
+        }
+
+        await this.materializeGroupStage(tx, eventId, groups);
+      }
+
+      await tx.event.update({
+        where: { id: eventId },
+        data: { drawLocked: true, drawGeneratedAt: new Date() },
+      });
+
+      await this.drawLogService.create(tx, {
+        eventItemId: eventId,
+        drawBracketId: draw.id,
+        operationType: DrawOperationType.EXECUTE,
+        operatorId,
+        operatorNameSnapshot: operatorName,
+        afterData: {
+          drawId: draw.id,
+          version: draw.version,
+          format,
+        } as Prisma.InputJsonValue,
+      });
+
+      return tx.drawBracket.findUniqueOrThrow({
+        where: { id: draw.id },
+        include: {
+          slots: { orderBy: { position: 'asc' } },
+          groups: { include: { members: true }, orderBy: { sortOrder: 'asc' } },
+        },
+      });
+    });
+  }
+
+  async swapDrawSlots(
+    eventId: string,
+    drawId: string,
+    positionA: number,
+    positionB: number,
+    operatorId: string,
+    operatorName: string | null,
+  ) {
+    if (!operatorId) throw new BadRequestException('缺少操作人信息');
+    if (positionA === positionB) throw new BadRequestException('不能交换同一个签位');
+
+    return this.prisma.$transaction(async (tx) => {
+      const draw = await tx.drawBracket.findUnique({
+        where: { id: drawId },
+      });
+      if (!draw || draw.eventItemId !== eventId) throw new NotFoundException('签表不存在');
+      if (draw.status !== DrawStatus.DRAWN) throw new ConflictException('当前签表不可调整');
+      if (draw.format !== DrawFormat.single_elim) {
+        throw new BadRequestException('当前仅支持单淘汰签位交换');
+      }
+
+      const slotA = await tx.drawSlot.findFirstOrThrow({
+        where: { drawBracketId: drawId, position: positionA },
+      });
+      const slotB = await tx.drawSlot.findFirstOrThrow({
+        where: { drawBracketId: drawId, position: positionB },
+      });
+
+      await tx.drawSlot.update({
+        where: { id: slotA.id },
+        data: {
+          entrantId: slotB.entrantId,
+          entrantNameSnapshot: slotB.entrantNameSnapshot,
+          seedNoSnapshot: slotB.seedNoSnapshot,
+          isSeed: slotB.isSeed,
+          isBye: slotB.isBye,
+          sourceType: 'MANUAL_SWAP',
+          groupRankCode: slotB.groupRankCode,
+        },
+      });
+
+      await tx.drawSlot.update({
+        where: { id: slotB.id },
+        data: {
+          entrantId: slotA.entrantId,
+          entrantNameSnapshot: slotA.entrantNameSnapshot,
+          seedNoSnapshot: slotA.seedNoSnapshot,
+          isSeed: slotA.isSeed,
+          isBye: slotA.isBye,
+          sourceType: 'MANUAL_SWAP',
+          groupRankCode: slotA.groupRankCode,
+        },
+      });
+
+      const refreshedSlots = await tx.drawSlot.findMany({
+        where: { drawBracketId: drawId },
+        orderBy: { position: 'asc' },
+      });
+      await this.materializeSingleElimination(tx, eventId, refreshedSlots);
+
+      await this.drawLogService.create(tx, {
+        eventItemId: eventId,
+        drawBracketId: drawId,
+        operationType: DrawOperationType.SWAP,
+        operatorId,
+        operatorNameSnapshot: operatorName,
+        positionA,
+        positionB,
+        beforeData: { slotA, slotB } as Prisma.InputJsonValue,
+      });
+
+      return tx.drawBracket.findUniqueOrThrow({
+        where: { id: drawId },
+        include: { slots: { orderBy: { position: 'asc' } } },
+      });
+    });
+  }
+
+  async freezeDraw(
+    eventId: string,
+    drawId: string,
+    operatorId: string,
+    operatorName: string | null,
+  ) {
+    if (!operatorId) throw new BadRequestException('缺少操作人信息');
+    const draw = await this.prisma.drawBracket.findUnique({ where: { id: drawId } });
+    if (!draw || draw.eventItemId !== eventId) throw new NotFoundException('签表不存在');
+    if (draw.status !== DrawStatus.DRAWN) throw new ConflictException('只有已抽签状态才能冻结');
+
+    return this.prisma.$transaction(async (tx) => {
+      const frozen = await tx.drawBracket.update({
+        where: { id: drawId },
+        data: {
+          status: DrawStatus.FROZEN,
+          frozenAt: new Date(),
+          updatedBy: operatorId,
+        },
+      });
+
+      await tx.event.update({
+        where: { id: eventId },
+        data: { drawLocked: true },
+      });
+
+      await this.drawLogService.create(tx, {
+        eventItemId: eventId,
+        drawBracketId: drawId,
+        operationType: DrawOperationType.FREEZE,
+        operatorId,
+        operatorNameSnapshot: operatorName,
+        beforeData: { status: draw.status } as Prisma.InputJsonValue,
+        afterData: { status: DrawStatus.FROZEN } as Prisma.InputJsonValue,
+      });
+
+      return frozen;
+    });
+  }
+
+  async unfreezeDraw(
+    eventId: string,
+    drawId: string,
+    operatorId: string,
+    operatorName: string | null,
+  ) {
+    if (!operatorId) throw new BadRequestException('缺少操作人信息');
+    const draw = await this.prisma.drawBracket.findUnique({ where: { id: drawId } });
+    if (!draw || draw.eventItemId !== eventId) throw new NotFoundException('签表不存在');
+    if (draw.status !== DrawStatus.FROZEN) throw new ConflictException('当前签表尚未冻结');
+
+    const lockedMatches = await this.prisma.match.count({
+      where: {
+        eventId,
+        status: { in: [MatchStatus.LIVE, MatchStatus.COMPLETED] },
+      },
+    });
+    if (lockedMatches > 0) {
+      throw new ConflictException('已有进行中或已结束比赛，暂不允许解冻签表');
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const unfrozen = await tx.drawBracket.update({
+        where: { id: drawId },
+        data: {
+          status: DrawStatus.DRAWN,
+          frozenAt: null,
+          updatedBy: operatorId,
+        },
+      });
+
+      await tx.event.update({
+        where: { id: eventId },
+        data: { drawLocked: false },
+      });
+
+      await this.drawLogService.create(tx, {
+        eventItemId: eventId,
+        drawBracketId: drawId,
+        operationType: DrawOperationType.FREEZE,
+        operatorId,
+        operatorNameSnapshot: operatorName,
+        beforeData: { status: draw.status } as Prisma.InputJsonValue,
+        afterData: { status: DrawStatus.DRAWN } as Prisma.InputJsonValue,
+        remark: 'UNFREEZE',
+      });
+
+      return unfrozen;
+    });
+  }
+
+  async redraw(
+    eventId: string,
+    confirm: boolean,
+    operatorId: string,
+    operatorName: string | null,
+  ) {
+    if (!confirm) throw new BadRequestException('重新抽签需要确认');
+    const current = await this.prisma.drawBracket.findFirst({
+      where: { eventItemId: eventId, isCurrent: true },
+      orderBy: { version: 'desc' },
+    });
+    if (!current) throw new NotFoundException('当前单项还没有可重抽的签表');
+
+    const next = await this.executeDraw(eventId, operatorId, operatorName, true);
+    await this.prisma.drawOperationLog.create({
+      data: {
+        eventItemId: eventId,
+        drawBracketId: next.id,
+        operationType: DrawOperationType.REDRAW,
+        operatorId,
+        operatorNameSnapshot: operatorName,
+        beforeData: {
+          previousDrawId: current.id,
+          previousVersion: current.version,
+        },
+        afterData: {
+          currentDrawId: next.id,
+          currentVersion: next.version,
+        },
+      },
+    });
+    return next;
+  }
+
+  async getDrawHistory(eventId: string) {
+    await this.ensureEvent(eventId);
+    return this.prisma.drawBracket.findMany({
+      where: { eventItemId: eventId },
+      orderBy: { version: 'desc' },
+    });
+  }
+
+  async getDrawLogs(eventId: string, query: GetDrawLogsQueryDto) {
+    await this.ensureEvent(eventId);
+    const page = query.page ?? 1;
+    const pageSize = query.pageSize ?? 20;
+    const where = {
+      eventItemId: eventId,
+      ...(query.drawId ? { drawBracketId: query.drawId } : {}),
+    };
+
+    const [list, total] = await Promise.all([
+      this.prisma.drawOperationLog.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.drawOperationLog.count({ where }),
+    ]);
+
+    return { list, total, page, pageSize };
   }
 
   async getBracket(eventId: string) {
@@ -138,7 +671,7 @@ export class DrawsService {
     if (!event) throw new NotFoundException('单项不存在');
 
     const registrations = await this.prisma.registration.findMany({
-      where: { eventId },
+      where: { eventId, status: RegistrationStatus.APPROVED },
       include: { player1: true, player2: true },
       orderBy: [{ isSeed: 'desc' }, { seedRank: 'asc' }, { createdAt: 'asc' }],
     });
@@ -146,6 +679,10 @@ export class DrawsService {
     const matches = await this.prisma.match.findMany({
       where: { eventId },
       orderBy: [{ roundNo: 'asc' }, { matchNo: 'asc' }],
+    });
+    const currentDraw = await this.prisma.drawBracket.findFirst({
+      where: { eventItemId: eventId, isCurrent: true },
+      orderBy: { version: 'desc' },
     });
 
     const hydrateMatch = (match: (typeof matches)[number]) => ({
@@ -189,12 +726,10 @@ export class DrawsService {
       }, []);
 
     for (const group of groups) {
-      group.matches = matches
-        .filter((match) => match.round === group.name)
-        .map((match) => hydrateMatch(match));
+      group.matches = matches.filter((match) => match.round === group.name).map((match) => hydrateMatch(match));
     }
 
-    return { event, registrations, rounds, groups };
+    return { event, currentDraw, registrations, rounds, groups };
   }
 
   private async ensureEvent(eventId: string) {
@@ -234,88 +769,122 @@ export class DrawsService {
     const count = await this.prisma.registration.count({
       where: {
         OR: [{ player1Id: playerId }, { player2Id: playerId }],
+        status: RegistrationStatus.APPROVED,
         eventId: { not: currentEventId },
       },
     });
     if (count >= 2) throw new ConflictException('同一选手最多报名 2 个单项');
   }
 
-  private async generateSingleEliminationDraw(
-    eventId: string,
-    registrations: RegistrationWithPlayers[],
+  private validateSeedSettings(
+    seeds: Array<{ entrantId: string; seedNo: number }>,
+    seedLimit: number,
   ) {
-    const bracketSize = this.nextPowerOfTwo(registrations.length);
-    const slots = this.seedSingleEliminationSlots(registrations, bracketSize);
+    if (seeds.length > seedLimit) {
+      throw new BadRequestException('种子数量超过上限');
+    }
+
+    const seenEntrants = new Set<string>();
+    const sortedSeedNos = seeds.map((item) => item.seedNo).sort((a, b) => a - b);
+    for (const seed of seeds) {
+      if (seenEntrants.has(seed.entrantId)) {
+        throw new BadRequestException('同一选手不能重复设为种子');
+      }
+      seenEntrants.add(seed.entrantId);
+    }
+
+    for (let index = 0; index < sortedSeedNos.length; index += 1) {
+      if (sortedSeedNos[index] !== index + 1) {
+        throw new BadRequestException('种子编号必须从 1 开始连续');
+      }
+    }
+  }
+
+  private async materializeSingleElimination(
+    tx: Prisma.TransactionClient,
+    eventId: string,
+    slots: Array<{
+      position: number;
+      entrantId: string | null;
+      isBye: boolean;
+    }>,
+  ) {
+    await tx.match.deleteMany({ where: { eventId } });
+    await tx.registration.updateMany({ where: { eventId }, data: { groupName: null } });
+
+    const slotEntries = slots.map((slot) => ({
+      entrantId: slot.isBye ? null : slot.entrantId,
+      isPendingWinner: false,
+    }));
     const drafts: MatchDraft[] = [];
     let roundNo = 1;
-    let currentSlots = slots;
+    let currentSlots = slotEntries;
 
     while (currentSlots.length >= 2) {
-      const roundLabel = this.roundLabel(currentSlots.length);
-      const nextSlots: Array<RegistrationWithPlayers | null> = [];
+      const roundLabel = this.drawAlgorithmService.roundLabel(currentSlots.length);
+      const nextSlots: Array<{ entrantId: string | null; isPendingWinner: boolean }> = [];
       for (let i = 0; i < currentSlots.length; i += 2) {
         const side1 = currentSlots[i];
         const side2 = currentSlots[i + 1];
-        const hasBye = Boolean(side1) !== Boolean(side2);
+        const side1Id = side1?.entrantId ?? null;
+        const side2Id = side2?.entrantId ?? null;
+        const side1IsRealBye = !side1Id && !side1?.isPendingWinner;
+        const side2IsRealBye = !side2Id && !side2?.isPendingWinner;
+        const hasBye =
+          (Boolean(side1Id) && side2IsRealBye) ||
+          (Boolean(side2Id) && side1IsRealBye);
         drafts.push({
           round: roundLabel,
           roundNo,
           matchNo: i / 2 + 1,
-          side1Id: side1?.id ?? null,
-          side2Id: side2?.id ?? null,
+          side1Id,
+          side2Id,
           status: hasBye ? MatchStatus.COMPLETED : MatchStatus.PENDING,
-          winnerSide: hasBye ? (side1 ? 1 : 2) : null,
+          winnerSide: hasBye ? (side1Id ? 1 : 2) : null,
         });
-        nextSlots.push(hasBye ? (side1 ?? side2) : null);
+        nextSlots.push({
+          entrantId: hasBye ? (side1Id ?? side2Id) : null,
+          isPendingWinner: !hasBye,
+        });
       }
       currentSlots = nextSlots;
       roundNo += 1;
     }
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.match.deleteMany({ where: { eventId } });
-      await tx.registration.updateMany({ where: { eventId }, data: { groupName: null } });
-      await this.createMatchDrafts(tx, eventId, drafts);
-      await tx.event.update({
-        where: { id: eventId },
-        data: { drawLocked: true, drawGeneratedAt: new Date() },
-      });
-    });
+    await this.createMatchDrafts(tx, eventId, drafts);
   }
 
-  private async generateGroupDraw(
+  private async materializeGroupStage(
+    tx: Prisma.TransactionClient,
     eventId: string,
-    registrations: RegistrationWithPlayers[],
-    groupSize: number,
+    groups: Array<{
+      groupCode: string;
+      members: Array<{ entrantId: string }>;
+    }>,
   ) {
-    const groupCount = Math.max(2, Math.ceil(registrations.length / groupSize));
-    const groupNames = Array.from({ length: groupCount }, (_, index) =>
-      String.fromCharCode(65 + index),
-    );
-    const groups = groupNames.map((name) => ({ name, registrations: [] as RegistrationWithPlayers[] }));
-    const seeds = registrations
-      .filter((registration) => registration.isSeed)
-      .sort((a, b) => (a.seedRank ?? 999) - (b.seedRank ?? 999));
-    const nonSeeds = this.shuffle(registrations.filter((registration) => !registration.isSeed));
-    const ordered = [...seeds, ...nonSeeds];
+    await tx.match.deleteMany({ where: { eventId } });
+    await tx.registration.updateMany({ where: { eventId }, data: { groupName: null } });
 
-    for (const registration of ordered) {
-      const target = [...groups].sort(
-        (a, b) => a.registrations.length - b.registrations.length,
-      )[0];
-      target.registrations.push(registration);
+    for (const group of groups) {
+      const ids = group.members.map((member) => member.entrantId);
+      if (ids.length) {
+        await tx.registration.updateMany({
+          where: { id: { in: ids } },
+          data: { groupName: group.groupCode },
+        });
+      }
     }
 
     const drafts: MatchDraft[] = [];
     for (const group of groups) {
-      for (let i = 0; i < group.registrations.length; i += 1) {
-        for (let j = i + 1; j < group.registrations.length; j += 1) {
+      for (let i = 0; i < group.members.length; i += 1) {
+        for (let j = i + 1; j < group.members.length; j += 1) {
           drafts.push({
-            round: group.name,
+            round: group.groupCode,
             roundNo: 0,
-            matchNo: drafts.filter((draft) => draft.round === group.name).length + 1,
-            side1Id: group.registrations[i].id,
-            side2Id: group.registrations[j].id,
+            matchNo: drafts.filter((draft) => draft.round === group.groupCode).length + 1,
+            side1Id: group.members[i].entrantId,
+            side2Id: group.members[j].entrantId,
             status: MatchStatus.PENDING,
             winnerSide: null,
           });
@@ -323,20 +892,7 @@ export class DrawsService {
       }
     }
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.match.deleteMany({ where: { eventId } });
-      for (const group of groups) {
-        await tx.registration.updateMany({
-          where: { id: { in: group.registrations.map((registration) => registration.id) } },
-          data: { groupName: group.name },
-        });
-      }
-      await this.createMatchDrafts(tx, eventId, drafts);
-      await tx.event.update({
-        where: { id: eventId },
-        data: { drawLocked: true, drawGeneratedAt: new Date() },
-      });
-    });
+    await this.createMatchDrafts(tx, eventId, drafts);
   }
 
   private async createMatchDrafts(
@@ -360,60 +916,13 @@ export class DrawsService {
     }
   }
 
-  private seedSingleEliminationSlots(
-    registrations: RegistrationWithPlayers[],
-    bracketSize: number,
-  ) {
-    const slots: Array<RegistrationWithPlayers | null> = Array.from({ length: bracketSize }, () => null);
-    const seedPositions = this.seedPositions(bracketSize);
-    const seeds = registrations
-      .filter((registration) => registration.isSeed)
-      .sort((a, b) => (a.seedRank ?? 999) - (b.seedRank ?? 999));
-    const placedSeedIds = new Set<string>();
-
-    seeds.forEach((registration, index) => {
-      const position = seedPositions[index];
-      if (position !== undefined) {
-        slots[position] = registration;
-        placedSeedIds.add(registration.id);
-      }
-    });
-
-    const remaining = this.shuffle(
-      registrations.filter((registration) => !placedSeedIds.has(registration.id)),
-    );
-    for (const registration of remaining) {
-      const emptyIndex = slots.findIndex((slot) => slot === null);
-      if (emptyIndex >= 0) slots[emptyIndex] = registration;
+  private registrationName(registration: RegistrationWithPlayers | Registration) {
+    const maybeRegistration = registration as RegistrationWithPlayers;
+    if (maybeRegistration.player1) {
+      return maybeRegistration.player2
+        ? `${maybeRegistration.player1.name} / ${maybeRegistration.player2.name}`
+        : maybeRegistration.player1.name;
     }
-    return slots;
-  }
-
-  private seedPositions(size: number) {
-    const positions = [0, size - 1, Math.floor(size / 2), Math.floor(size / 2) - 1];
-    for (let i = 0; i < size; i += 1) {
-      if (!positions.includes(i)) positions.push(i);
-    }
-    return positions;
-  }
-
-  private roundLabel(slotCount: number) {
-    if (slotCount === 2) return 'F';
-    if (slotCount === 4) return 'SF';
-    if (slotCount === 8) return 'QF';
-    return `R${slotCount}`;
-  }
-
-  private nextPowerOfTwo(value: number) {
-    return 2 ** Math.ceil(Math.log2(value));
-  }
-
-  private shuffle<T>(items: T[]) {
-    const result = [...items];
-    for (let i = result.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [result[i], result[j]] = [result[j], result[i]];
-    }
-    return result;
+    return registration.name ?? registration.id;
   }
 }
