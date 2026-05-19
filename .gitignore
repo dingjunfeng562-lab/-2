@@ -1,8 +1,28 @@
+# dependencies
 node_modules/
-dist/
-.next/
+
+# env
 .env
 .env.local
-*.env.local
-prisma/migrations/
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# build output
+dist/
+build/
+.next/
+.vite/
+
+# editor / local tools
+.vscode/
+.idea/
+.claude/
+.worktrees/
+
+# docs/local
 羽毛球比赛系统-需求文档.md
